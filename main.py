@@ -1,0 +1,300 @@
+import os
+import glob
+import hashlib
+import math
+import sqlite3
+import pefile
+from datetime import datetime
+
+def calc_entropy(data):
+    if not data:
+        return 0.0
+    entropy = 0
+    for x in range(256):
+        p_x = float(data.count(bytes([x]))) / len(data)
+        if p_x > 0:
+            entropy -= p_x * math.log2(p_x)
+    return entropy
+
+def get_hashes(data):
+    return {
+        'sha256': hashlib.sha256(data).hexdigest(),
+        'md5': hashlib.md5(data).hexdigest(),
+        'sha1': hashlib.sha1(data).hexdigest()
+    }
+
+def is_packed(pe):
+    for section in pe.sections:
+        if calc_entropy(section.get_data()) > 7.5:
+            return True
+    return False
+
+def get_code_signing(pe_path):
+    try:
+        pe = pefile.PE(pe_path)
+        if hasattr(pe, 'DIRECTORY_ENTRY_SECURITY'):
+            return True
+    except Exception:
+        pass
+    return False
+
+def get_pdb_info(pe):
+    try:
+        for entry in pe.DIRECTORY_ENTRY_DEBUG:
+            dbg = entry.entry
+            if hasattr(dbg, 'PdbFileName'):
+                return dbg.PdbFileName.decode(errors='ignore')
+    except Exception:
+        pass
+    return None
+
+def get_resource_info(pe):
+    resources = []
+    if hasattr(pe, 'DIRECTORY_ENTRY_RESOURCE'):
+        for resource_type in pe.DIRECTORY_ENTRY_RESOURCE.entries:
+            resources.append(str(resource_type.name or resource_type.struct.Id))
+    return ','.join(resources)
+
+def get_sections_info(pe):
+    sections = []
+    for s in pe.sections:
+        sections.append({
+            'name': s.Name.decode(errors='ignore').strip('\x00'),
+            'entropy': calc_entropy(s.get_data()),
+            'size': s.SizeOfRawData,
+            'virtual_size': s.Misc_VirtualSize,
+            'characteristics': hex(s.Characteristics)
+        })
+    return sections
+
+def get_imports(pe):
+    imports = []
+    if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
+        for entry in pe.DIRECTORY_ENTRY_IMPORT:
+            dll = entry.dll.decode(errors='ignore')
+            for imp in entry.imports:
+                imports.append(f"{dll}:{imp.name.decode(errors='ignore') if imp.name else imp.ordinal}")
+    return ','.join(imports)
+
+def get_exports(pe):
+    exports = []
+    if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+        for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+            exports.append(exp.name.decode(errors='ignore') if exp.name else str(exp.ordinal))
+    return ','.join(exports)
+
+def get_version_info(pe):
+    info = {}
+    try:
+        if hasattr(pe, 'FileInfo'):
+            for fileinfo in pe.FileInfo:
+                # fileinfo가 리스트인 경우(중첩) 재귀적으로 처리
+                if isinstance(fileinfo, list):
+                    for subinfo in fileinfo:
+                        if hasattr(subinfo, 'Key') and subinfo.Key == b'StringFileInfo':
+                            for st in getattr(subinfo, 'StringTable', []):
+                                try:
+                                    info.update({k.decode(errors='ignore'): v.decode(errors='ignore') for k, v in st.entries.items()})
+                                except Exception:
+                                    continue
+                elif hasattr(fileinfo, 'Key') and fileinfo.Key == b'StringFileInfo':
+                    for st in getattr(fileinfo, 'StringTable', []):
+                        try:
+                            info.update({k.decode(errors='ignore'): v.decode(errors='ignore') for k, v in st.entries.items()})
+                        except Exception:
+                            continue
+    except Exception as e:
+        print(f"버전 정보 분석 중 오류 발생: {e}")
+    return info
+
+def analyze_pe_file(pe_path):
+    try:
+        pe = pefile.PE(pe_path)
+        with open(pe_path, 'rb') as f:
+            data = f.read()
+        hashes = get_hashes(data)
+        version_info = get_version_info(pe)
+        sections_info = get_sections_info(pe)
+        info = {
+            'path': pe_path,
+            'sha256': hashes['sha256'],
+            'md5': hashes['md5'],
+            'sha1': hashes['sha1'],
+            'entropy': calc_entropy(data),
+            'packed': is_packed(pe),
+            'size': os.path.getsize(pe_path),
+            'code_signed': get_code_signing(pe_path),
+            'created': datetime.fromtimestamp(os.path.getctime(pe_path)),
+            'accessed': datetime.fromtimestamp(os.path.getatime(pe_path)),
+            'modified': datetime.fromtimestamp(os.path.getmtime(pe_path)),
+            'sections': str(sections_info),
+            'imports': get_imports(pe),
+            'exports': get_exports(pe),
+            'pdb': get_pdb_info(pe),
+            'resources': get_resource_info(pe),
+            'timestamp': pe.FILE_HEADER.TimeDateStamp,
+            'machine': hex(pe.FILE_HEADER.Machine),
+            'subsystem': hex(pe.OPTIONAL_HEADER.Subsystem),
+            'entrypoint': hex(pe.OPTIONAL_HEADER.AddressOfEntryPoint),
+            'tls_callbacks': str(getattr(pe, 'DIRECTORY_ENTRY_TLS', None)),
+            'company_name': version_info.get('CompanyName', ''),
+            'product_name': version_info.get('ProductName', ''),
+            'file_description': version_info.get('FileDescription', ''),
+            'file_version': version_info.get('FileVersion', ''),
+        }
+        return info
+    except Exception as e:
+        print(f"Error analyzing {pe_path}: {e}")
+        return None
+
+def save_to_sqlite(db_path, results):
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS pe_info (
+            path TEXT PRIMARY KEY,
+            sha256 TEXT,
+            md5 TEXT,
+            sha1 TEXT,
+            entropy REAL,
+            packed INTEGER,
+            size INTEGER,
+            code_signed INTEGER,
+            created TEXT,
+            accessed TEXT,
+            modified TEXT,
+            sections TEXT,
+            imports TEXT,
+            exports TEXT,
+            pdb TEXT,
+            resources TEXT,
+            timestamp INTEGER,
+            machine TEXT,
+            subsystem TEXT,
+            entrypoint TEXT,
+            tls_callbacks TEXT,
+            company_name TEXT,
+            product_name TEXT,
+            file_description TEXT,
+            file_version TEXT
+        )
+    ''')
+    for info in results:
+        if info:
+            c.execute('''
+                INSERT OR REPLACE INTO pe_info VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                info.get('path'),
+                info.get('sha256'),
+                info.get('md5'),
+                info.get('sha1'),
+                info.get('entropy'),
+                int(info.get('packed', 0)) if info.get('packed') is not None else None,
+                info.get('size'),
+                int(info.get('code_signed', 0)) if info.get('code_signed') is not None else None,
+                str(info.get('created')) if info.get('created') is not None else None,
+                str(info.get('accessed')) if info.get('accessed') is not None else None,
+                str(info.get('modified')) if info.get('modified') is not None else None,
+                info.get('sections'),
+                info.get('imports'),
+                info.get('exports'),
+                info.get('pdb'),
+                info.get('resources'),
+                info.get('timestamp'),
+                info.get('machine'),
+                info.get('subsystem'),
+                info.get('entrypoint'),
+                info.get('tls_callbacks'),
+                info.get('company_name'),
+                info.get('product_name'),
+                info.get('file_description'),
+                info.get('file_version')
+            ))
+    conn.commit()
+    conn.close()
+
+def is_already_analyzed(db_path, sha256, path):
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    # 테이블이 없으면 생성
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS pe_info (
+            path TEXT PRIMARY KEY,
+            sha256 TEXT,
+            md5 TEXT,
+            sha1 TEXT,
+            entropy REAL,
+            packed INTEGER,
+            size INTEGER,
+            code_signed INTEGER,
+            created TEXT,
+            accessed TEXT,
+            modified TEXT,
+            sections TEXT,
+            imports TEXT,
+            exports TEXT,
+            pdb TEXT,
+            resources TEXT,
+            timestamp INTEGER,
+            machine TEXT,
+            subsystem TEXT,
+            entrypoint TEXT,
+            tls_callbacks TEXT,
+            company_name TEXT,
+            product_name TEXT,
+            file_description TEXT,
+            file_version TEXT
+        )
+    ''')
+    c.execute("SELECT path FROM pe_info WHERE sha256=? AND path=?", (sha256, path))
+    result = c.fetchone()
+    conn.close()
+    return result is not None
+
+def main(data_path, db_path='pe_info.db'):
+    results = []
+    if os.path.isfile(data_path):
+        if data_path.lower().endswith(('.exe', '.dll')):
+            with open(data_path, 'rb') as f:
+                data = f.read()
+            sha256 = hashlib.sha256(data).hexdigest()
+            if is_already_analyzed(db_path, sha256, data_path):
+                print(f"이미 분석된 파일입니다: {data_path}")
+                return
+            print(f"분석 중: {data_path} ...", end='', flush=True)
+            info = analyze_pe_file(data_path)
+            if info:
+                results.append(info)
+            print(" 완료")
+        else:
+            print("PE 파일(.exe, .dll)만 입력 가능합니다. 파일 경로를 다시 입력해주세요.")
+            return
+    else:
+        pe_files = glob.glob(os.path.join(data_path, '**', '*.exe'), recursive=True)
+        pe_files += glob.glob(os.path.join(data_path, '**', '*.dll'), recursive=True)
+        total = len(pe_files)
+        print(f"총 {total}개 파일 분석 시작")
+        for idx, pe_path in enumerate(pe_files, 1):
+            with open(pe_path, 'rb') as f:
+                data = f.read()
+            sha256 = hashlib.sha256(data).hexdigest()
+            if is_already_analyzed(db_path, sha256, pe_path):
+                print(f"[{idx}/{total}] 이미 분석된 파일입니다: {pe_path}")
+                continue
+            print(f"[{idx}/{total}] 분석 중: {pe_path} ...", end='', flush=True)
+            info = analyze_pe_file(pe_path)
+            if info:
+                results.append(info)
+            print(" 완료")
+    if results:
+        save_to_sqlite(db_path, results)
+    print(f"분석 완료! {len(results)}개 파일이 DB에 저장되었습니다.")
+
+if __name__ == '__main__':
+    import sys
+    if len(sys.argv) < 2:
+        print("사용법: python pe_info_collector.py <데이터_경로 또는 파일> [DB경로]")
+    else:
+        data_path = sys.argv[1]
+        db_path = sys.argv[2] if len(sys.argv) > 2 else 'pe_info.db'
+        main(data_path, db_path)
