@@ -260,8 +260,12 @@ def main(data_path, db_path='pe_info.db'):
             print("PE 파일(.exe, .dll)만 입력 가능합니다. 파일 경로를 다시 입력해주세요.")
             return
     elif os.path.isdir(data_path):
-        pe_files = glob.glob(os.path.join(data_path, '**', '*.exe'), recursive=True)
-        pe_files += glob.glob(os.path.join(data_path, '**', '*.dll'), recursive=True)
+        # 폴더 내의 PE 파일만 분석
+        pe_files = []
+        for root, dirs, files in os.walk(data_path):
+            for file in files:
+                if file.lower().endswith(('.exe', '.dll')):
+                    pe_files.append(os.path.join(root, file))
         total = len(pe_files)
         print(f"총 {total}개 파일 분석 시작")
         for idx, pe_path in enumerate(pe_files, 1):
@@ -298,4 +302,4 @@ if __name__ == '__main__':
     else:
         data_path = sys.argv[1]
         db_path = sys.argv[2] if len(sys.argv) > 2 else 'pe_info.db'
-        main(data_path, db_path) 
+        main(data_path, db_path)
