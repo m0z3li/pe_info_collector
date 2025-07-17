@@ -4,6 +4,7 @@ import hashlib
 import math
 import sqlite3
 import pefile
+import json
 from datetime import datetime
 
 def calc_entropy(data):
@@ -24,6 +25,7 @@ def get_hashes(data):
     }
 
 def is_packed(pe):
+    # 엔트로피 기반 패킹 탐지 (시그니처 기반으로 바꾸려면 별도 구현 필요)
     for section in pe.sections:
         if calc_entropy(section.get_data()) > 7.5:
             return True
@@ -58,12 +60,15 @@ def get_resource_info(pe):
 def get_sections_info(pe):
     sections = []
     for s in pe.sections:
+        section_data = s.get_data()
         sections.append({
             'name': s.Name.decode(errors='ignore').strip('\x00'),
-            'entropy': calc_entropy(s.get_data()),
+            'entropy': calc_entropy(section_data),
             'size': s.SizeOfRawData,
             'virtual_size': s.Misc_VirtualSize,
-            'characteristics': hex(s.Characteristics)
+            'characteristics': hex(s.Characteristics),
+            'sha256': hashlib.sha256(section_data).hexdigest() if section_data else None,
+            'md5': hashlib.md5(section_data).hexdigest() if section_data else None
         })
     return sections
 
@@ -88,7 +93,6 @@ def get_version_info(pe):
     try:
         if hasattr(pe, 'FileInfo'):
             for fileinfo in pe.FileInfo:
-                # fileinfo가 리스트인 경우(중첩) 재귀적으로 처리
                 if isinstance(fileinfo, list):
                     for subinfo in fileinfo:
                         if hasattr(subinfo, 'Key') and subinfo.Key == b'StringFileInfo':
@@ -106,6 +110,88 @@ def get_version_info(pe):
     except Exception as e:
         print(f"버전 정보 분석 중 오류 발생: {e}")
     return info
+
+def init_db(db_path):
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS pe_info (
+            path TEXT PRIMARY KEY,
+            sha256 TEXT,
+            md5 TEXT,
+            sha1 TEXT,
+            entropy REAL,
+            packed INTEGER,
+            size INTEGER,
+            code_signed INTEGER,
+            created TEXT,
+            accessed TEXT,
+            modified TEXT,
+            sections TEXT,
+            sections_hashes TEXT,
+            imports TEXT,
+            exports TEXT,
+            pdb TEXT,
+            resources TEXT,
+            timestamp INTEGER,
+            machine TEXT,
+            subsystem TEXT,
+            entrypoint TEXT,
+            tls_callbacks TEXT,
+            company_name TEXT,
+            product_name TEXT,
+            file_description TEXT,
+            file_version TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def save_to_sqlite(db_path, results):
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    for info in results:
+        if info:
+            c.execute('''
+                INSERT OR REPLACE INTO pe_info VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                info.get('path'),
+                info.get('sha256'),
+                info.get('md5'),
+                info.get('sha1'),
+                info.get('entropy'),
+                int(info.get('packed', 0)) if info.get('packed') is not None else None,
+                info.get('size'),
+                int(info.get('code_signed', 0)) if info.get('code_signed') is not None else None,
+                str(info.get('created')) if info.get('created') is not None else None,
+                str(info.get('accessed')) if info.get('accessed') is not None else None,
+                str(info.get('modified')) if info.get('modified') is not None else None,
+                info.get('sections'),
+                info.get('sections_hashes'),
+                info.get('imports'),
+                info.get('exports'),
+                info.get('pdb'),
+                info.get('resources'),
+                info.get('timestamp'),
+                info.get('machine'),
+                info.get('subsystem'),
+                info.get('entrypoint'),
+                info.get('tls_callbacks'),
+                info.get('company_name'),
+                info.get('product_name'),
+                info.get('file_description'),
+                info.get('file_version')
+            ))
+    conn.commit()
+    conn.close()
+
+def is_already_analyzed(db_path, sha256, path):
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute("SELECT path FROM pe_info WHERE sha256=? AND path=?", (sha256, path))
+    result = c.fetchone()
+    conn.close()
+    return result is not None
 
 def analyze_pe_file(pe_path):
     try:
@@ -127,7 +213,11 @@ def analyze_pe_file(pe_path):
             'created': datetime.fromtimestamp(os.path.getctime(pe_path)),
             'accessed': datetime.fromtimestamp(os.path.getatime(pe_path)),
             'modified': datetime.fromtimestamp(os.path.getmtime(pe_path)),
-            'sections': str(sections_info),
+            'sections': json.dumps(sections_info, ensure_ascii=False),
+            'sections_hashes': json.dumps([
+                {'name': s['name'], 'sha256': s['sha256'], 'md5': s['md5']}
+                for s in sections_info
+            ], ensure_ascii=False),
             'imports': get_imports(pe),
             'exports': get_exports(pe),
             'pdb': get_pdb_info(pe),
@@ -147,154 +237,65 @@ def analyze_pe_file(pe_path):
         print(f"Error analyzing {pe_path}: {e}")
         return None
 
-def save_to_sqlite(db_path, results):
-    conn = sqlite3.connect(db_path)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS pe_info (
-            path TEXT PRIMARY KEY,
-            sha256 TEXT,
-            md5 TEXT,
-            sha1 TEXT,
-            entropy REAL,
-            packed INTEGER,
-            size INTEGER,
-            code_signed INTEGER,
-            created TEXT,
-            accessed TEXT,
-            modified TEXT,
-            sections TEXT,
-            imports TEXT,
-            exports TEXT,
-            pdb TEXT,
-            resources TEXT,
-            timestamp INTEGER,
-            machine TEXT,
-            subsystem TEXT,
-            entrypoint TEXT,
-            tls_callbacks TEXT,
-            company_name TEXT,
-            product_name TEXT,
-            file_description TEXT,
-            file_version TEXT
-        )
-    ''')
-    for info in results:
-        if info:
-            c.execute('''
-                INSERT OR REPLACE INTO pe_info VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                info.get('path'),
-                info.get('sha256'),
-                info.get('md5'),
-                info.get('sha1'),
-                info.get('entropy'),
-                int(info.get('packed', 0)) if info.get('packed') is not None else None,
-                info.get('size'),
-                int(info.get('code_signed', 0)) if info.get('code_signed') is not None else None,
-                str(info.get('created')) if info.get('created') is not None else None,
-                str(info.get('accessed')) if info.get('accessed') is not None else None,
-                str(info.get('modified')) if info.get('modified') is not None else None,
-                info.get('sections'),
-                info.get('imports'),
-                info.get('exports'),
-                info.get('pdb'),
-                info.get('resources'),
-                info.get('timestamp'),
-                info.get('machine'),
-                info.get('subsystem'),
-                info.get('entrypoint'),
-                info.get('tls_callbacks'),
-                info.get('company_name'),
-                info.get('product_name'),
-                info.get('file_description'),
-                info.get('file_version')
-            ))
-    conn.commit()
-    conn.close()
-
-def is_already_analyzed(db_path, sha256, path):
-    conn = sqlite3.connect(db_path)
-    c = conn.cursor()
-    # 테이블이 없으면 생성
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS pe_info (
-            path TEXT PRIMARY KEY,
-            sha256 TEXT,
-            md5 TEXT,
-            sha1 TEXT,
-            entropy REAL,
-            packed INTEGER,
-            size INTEGER,
-            code_signed INTEGER,
-            created TEXT,
-            accessed TEXT,
-            modified TEXT,
-            sections TEXT,
-            imports TEXT,
-            exports TEXT,
-            pdb TEXT,
-            resources TEXT,
-            timestamp INTEGER,
-            machine TEXT,
-            subsystem TEXT,
-            entrypoint TEXT,
-            tls_callbacks TEXT,
-            company_name TEXT,
-            product_name TEXT,
-            file_description TEXT,
-            file_version TEXT
-        )
-    ''')
-    c.execute("SELECT path FROM pe_info WHERE sha256=? AND path=?", (sha256, path))
-    result = c.fetchone()
-    conn.close()
-    return result is not None
-
 def main(data_path, db_path='pe_info.db'):
+    init_db(db_path)
     results = []
     if os.path.isfile(data_path):
         if data_path.lower().endswith(('.exe', '.dll')):
-            with open(data_path, 'rb') as f:
-                data = f.read()
-            sha256 = hashlib.sha256(data).hexdigest()
-            if is_already_analyzed(db_path, sha256, data_path):
-                print(f"이미 분석된 파일입니다: {data_path}")
-                return
-            print(f"분석 중: {data_path} ...", end='', flush=True)
-            info = analyze_pe_file(data_path)
-            if info:
-                results.append(info)
-            print(" 완료")
+            try:
+                with open(data_path, 'rb') as f:
+                    data = f.read()
+                sha256 = hashlib.sha256(data).hexdigest()
+                if is_already_analyzed(db_path, sha256, data_path):
+                    print(f"이미 분석된 파일입니다: {data_path}")
+                    return
+                print(f"분석 중: {data_path} ...", end='', flush=True)
+                info = analyze_pe_file(data_path)
+                if info:
+                    results.append(info)
+                print(" 완료")
+            except Exception as e:
+                print(f"파일 분석 중 오류: {e}")
         else:
             print("PE 파일(.exe, .dll)만 입력 가능합니다. 파일 경로를 다시 입력해주세요.")
             return
-    else:
+    elif os.path.isdir(data_path):
         pe_files = glob.glob(os.path.join(data_path, '**', '*.exe'), recursive=True)
         pe_files += glob.glob(os.path.join(data_path, '**', '*.dll'), recursive=True)
         total = len(pe_files)
         print(f"총 {total}개 파일 분석 시작")
         for idx, pe_path in enumerate(pe_files, 1):
-            with open(pe_path, 'rb') as f:
-                data = f.read()
-            sha256 = hashlib.sha256(data).hexdigest()
-            if is_already_analyzed(db_path, sha256, pe_path):
-                print(f"[{idx}/{total}] 이미 분석된 파일입니다: {pe_path}")
-                continue
-            print(f"[{idx}/{total}] 분석 중: {pe_path} ...", end='', flush=True)
-            info = analyze_pe_file(pe_path)
-            if info:
-                results.append(info)
-            print(" 완료")
+            try:
+                with open(pe_path, 'rb') as f:
+                    data = f.read()
+                sha256 = hashlib.sha256(data).hexdigest()
+                if is_already_analyzed(db_path, sha256, pe_path):
+                    print(f"[{idx}/{total}] 이미 분석된 파일입니다: {pe_path}")
+                    continue
+                print(f"[{idx}/{total}] 분석 중: {pe_path} ...", end='', flush=True)
+                info = analyze_pe_file(pe_path)
+                if info:
+                    results.append(info)
+                print(" 완료")
+            except Exception as e:
+                print(f"[{idx}/{total}] 파일 분석 중 오류: {pe_path} ({e})")
+    else:
+        print(f"입력하신 경로 또는 파일이 존재하지 않거나 지원하지 않는 형식입니다: {data_path}")
+        return
     if results:
         save_to_sqlite(db_path, results)
     print(f"분석 완료! {len(results)}개 파일이 DB에 저장되었습니다.")
 
 if __name__ == '__main__':
     import sys
-    if len(sys.argv) < 2:
+    if len(sys.argv) < 2 or sys.argv[1] in ['--h', '--help', '-h', '-help']:
         print("사용법: python pe_info_collector.py <데이터_경로 또는 파일> [DB경로]")
+        print("옵션:")
+        print("  --h, --help, -h, -help   도움말 출력")
+        print("예시:")
+        print("  python pe_info_collector.py C:\\samples")
+        print("  python pe_info_collector.py C:\\samples result.db")
     else:
         data_path = sys.argv[1]
         db_path = sys.argv[2] if len(sys.argv) > 2 else 'pe_info.db'
-        main(data_path, db_path)
+        main(data_path, db_path) 
