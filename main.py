@@ -141,7 +141,9 @@ def init_db(db_path):
             company_name TEXT,
             product_name TEXT,
             file_description TEXT,
-            file_version TEXT
+            file_version TEXT,
+            has_rich_header INTEGER,
+            dll_characteristics TEXT
         )
     ''')
     conn.commit()
@@ -153,7 +155,7 @@ def save_to_sqlite(db_path, results):
     for info in results:
         if info:
             c.execute('''
-                INSERT OR REPLACE INTO pe_info VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO pe_info VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 info.get('path'),
                 info.get('sha256'),
@@ -180,7 +182,9 @@ def save_to_sqlite(db_path, results):
                 info.get('company_name'),
                 info.get('product_name'),
                 info.get('file_description'),
-                info.get('file_version')
+                info.get('file_version'),
+                int(info.get('has_rich_header', 0)),
+                info.get('dll_characteristics')
             ))
     conn.commit()
     conn.close()
@@ -192,6 +196,28 @@ def is_already_analyzed(db_path, sha256, path):
     result = c.fetchone()
     conn.close()
     return result is not None
+
+def get_dll_characteristics(pe):
+    # DLL Characteristics 플래그 분석
+    flags = []
+    val = pe.OPTIONAL_HEADER.DllCharacteristics
+    if val & 0x40:
+        flags.append('ASLR')
+    if val & 0x100:
+        flags.append('NX/DEP')
+    if val & 0x200:
+        flags.append('NoIsolation')
+    if val & 0x400:
+        flags.append('NoSEH')
+    if val & 0x800:
+        flags.append('NoBind')
+    if val & 0x1000:
+        flags.append('WDMDriver')
+    if val & 0x2000:
+        flags.append('GuardCF')
+    if val & 0x4000:
+        flags.append('TerminalServerAware')
+    return ','.join(flags) if flags else 'None'
 
 def analyze_pe_file(pe_path):
     try:
@@ -231,11 +257,21 @@ def analyze_pe_file(pe_path):
             'product_name': version_info.get('ProductName', ''),
             'file_description': version_info.get('FileDescription', ''),
             'file_version': version_info.get('FileVersion', ''),
+            'has_rich_header': has_rich_header(pe_path),
+            'dll_characteristics': get_dll_characteristics(pe),  # 추가
         }
         return info
     except Exception as e:
         print(f"Error analyzing {pe_path}: {e}")
         return None
+
+def has_rich_header(pe_path):
+    try:
+        pe = pefile.PE(pe_path)
+        # pefile은 rich_header 속성을 제공합니다.
+        return hasattr(pe, 'rich_header') and pe.rich_header is not None
+    except Exception:
+        return False
 
 def main(data_path, db_path='pe_info.db'):
     init_db(db_path)
